@@ -8,7 +8,8 @@ An intelligent route optimization system using **real-world APIs** for traffic, 
 | --------- | ------ | ----------- |
 | **OpenWeatherMap** | Current weather, temperature, visibility, wind | 1,000 calls/day |
 | **TomTom Traffic** | Real-time traffic flow, congestion, incidents | 2,500 transactions/day |
-| **OpenRouteService** | Real route geometry, distances, durations | 2,000 directions/day |
+| **OSRM** (public) | Real route geometry, distances, durations | Public demo instance |
+| **OpenRouteService** | Optional future routing backend | 2,000 directions/day |
 | **OpenStreetMap/Nominatim** | Worldwide geocoding & reverse geocoding | 1 req/sec |
 
 ## Quick Start
@@ -42,7 +43,7 @@ npm run dev
 
 - **Real Weather Data** — Live temperature, rainfall, visibility, wind from OpenWeatherMap
 - **Real Traffic Data** — Live congestion levels from TomTom Traffic API
-- **Real Route Geometry** — Actual road paths from OpenRouteService (not straight lines)
+- **Real Route Geometry** — Actual road paths from OSRM (not straight lines)
 - **Real Geocoding** — Worldwide location search via Nominatim (OpenStreetMap)
 - **Multi-factor Scoring** — Time, distance, safety, fuel, weather weighted optimization
 - **AI Insights** — Auto-generated savings analysis and warnings
@@ -61,7 +62,8 @@ npm run dev
 ```env
 OPENWEATHER_API_KEY=your_key      # Required
 TOMTOM_API_KEY=your_key           # Required
-OPENROUTE_API_KEY=your_key        # Required for real route geometry
+OPENROUTE_API_KEY=your_key        # Optional (reserved for future ORS routing)
+# Routing currently uses the public OSRM instance
 REDIS_URL=redis://localhost:6379/0 # Optional caching
 ```
 
