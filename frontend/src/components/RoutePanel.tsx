@@ -163,7 +163,7 @@ function LocationSearchInput({
           <button
             onClick={() => {
               setQuery("");
-              onSelect("", { lat: 0, lon: 0 });
+              onSelect("", { lat: Number.NaN, lon: Number.NaN });
             }}
             className="absolute right-6 top-1/2 -translate-y-1/2 text-slate-500 hover:text-white"
           >
@@ -572,7 +572,11 @@ export function RoutePanel({
             value={originName}
             onSelect={(name, coords) => {
               setOriginName(name);
-              setOriginCoords(coords);
+              setOriginCoords(
+                name && Number.isFinite(coords.lat) && Number.isFinite(coords.lon)
+                  ? coords
+                  : null,
+              );
             }}
             iconColor="bg-emerald-400"
             showLocateButton={true}
@@ -587,7 +591,11 @@ export function RoutePanel({
             value={destName}
             onSelect={(name, coords) => {
               setDestName(name);
-              setDestCoords(coords);
+              setDestCoords(
+                name && Number.isFinite(coords.lat) && Number.isFinite(coords.lon)
+                  ? coords
+                  : null,
+              );
             }}
             iconColor="bg-red-400"
           />
