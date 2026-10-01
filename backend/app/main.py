@@ -1,64 +1,86 @@
 """FastAPI application entry point."""
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
 
 from .core.config import settings
 from .routers import routes_router
 
 
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Attach baseline security headers to every response."""
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        response.headers.setdefault(
+            "Permissions-Policy",
+            "geolocation=(self), microphone=(), camera=()",
+        )
+        # API is JSON-only; CSP is intentionally minimal
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'none'; frame-ancestors 'none'",
+        )
+        return response
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
-    # Startup
-    print(f"🚀 Starting {settings.app_name}")
-    print(f"   Debug mode: {settings.debug}")
+    print(f"Starting {settings.app_name}")
+    print(f"  Debug mode: {settings.debug}")
+    weather_ready = bool(settings.openweather_api_key)
+    traffic_ready = bool(settings.tomtom_api_key)
+    print(f"  OpenWeatherMap key: {'set' if weather_ready else 'MISSING'}")
+    print(f"  TomTom key: {'set' if traffic_ready else 'MISSING'}")
     yield
-    # Shutdown
-    print("👋 Shutting down gracefully")
+    print("Shutting down gracefully")
 
 
 app = FastAPI(
     title=settings.app_name,
     description="""
-    Intelligent route optimization system that combines traffic conditions, 
+    Intelligent route optimization system that combines traffic conditions,
     weather data, and route analysis to recommend the most efficient path.
 
     ## Features
 
-    - **Multi-factor Optimization**: Considers time, distance, safety, fuel, and weather
-    - **Real-time Traffic**: Live congestion data and incident reports
-    - **Weather Integration**: Current conditions and impact assessment
-    - **AI Insights**: Intelligent recommendations and warnings
-    - **Traffic Heatmaps**: Visual congestion mapping
+    - **Multi-factor Optimization**: time, distance, safety, fuel, and weather
+    - **Real-time Traffic**: live congestion data (TomTom)
+    - **Weather Integration**: current conditions and impact assessment
+    - **AI Insights**: recommendations and warnings
+    - **Traffic Heatmaps**: visual congestion mapping
 
     ## Data Sources
 
     - OpenWeatherMap (weather)
-    - TomTom Traffic API (traffic data)
-    - Internal routing engine (path generation)
+    - TomTom Traffic API (traffic)
+    - OSRM (road geometry; public demo instance)
+    - OpenStreetMap / Nominatim (geocoding)
     """,
     version="1.0.0",
     lifespan=lifespan,
     docs_url="/docs",
-    redoc_url="/redoc"
+    redoc_url="/redoc",
 )
 
-origins = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://localhost:3000",
-]
-
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=settings.cors_origins_list,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["*"],
 )
+app.add_middleware(SecurityHeadersMiddleware)
 
 # Include routers
 app.include_router(routes_router, prefix="/api/v1")
@@ -71,19 +93,24 @@ async def root():
         "status": "ok",
         "service": settings.app_name,
         "version": "1.0.0",
-        "docs": "/docs"
+        "docs": "/docs",
     }
 
 
 @app.get("/health", tags=["health"])
-async def health_check() -> dict[str, str | dict[str, str]]:
-    """Detailed health check."""
+async def health_check() -> dict:
+    """Detailed health check with real timestamp and key presence."""
+    weather_configured = bool(settings.openweather_api_key)
+    traffic_configured = bool(settings.tomtom_api_key)
+
+    services = {
+        "routing_engine": "ok",  # OSRM public; no local key
+        "weather_api": "configured" if weather_configured else "missing_api_key",
+        "traffic_api": "configured" if traffic_configured else "missing_api_key",
+    }
+    all_ready = weather_configured and traffic_configured
     return {
-        "status": "healthy",
-        "timestamp": "2024-01-01T00:00:00Z",
-        "services": {
-            "routing_engine": "ok",
-            "weather_api": "ok",
-            "traffic_api": "ok"
-        }
+        "status": "healthy" if all_ready else "degraded",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "services": services,
     }
