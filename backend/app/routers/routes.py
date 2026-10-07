@@ -1,44 +1,33 @@
-"""API routes for route optimization using real geocoding data."""
+"""API routes for route optimization and geocoding."""
 import hashlib
 import logging
 import re
-from typing import Any, List, Optional, Dict
-
-import httpx
-from fastapi import APIRouter, HTTPException, Query, Request, Response, status
-from fastapi.responses import JSONResponse
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from xml.sax.saxutils import escape
-
-from ..core.config import settings
-from ..models.schemas import (
-    RouteRequest, RouteOptimizationResponse, TrafficHeatmapResponse,
-    Coordinates, LocationSearchResult, ErrorResponse, GpxExportRequest
-"""API routes for route optimization and geocoding."""
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, Response, status
 from fastapi.responses import JSONResponse
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from xml.sax.saxutils import escape
 
+from ..core.config import settings
 from ..core.constants import NOMINATIM_BASE_URL, NOMINATIM_USER_AGENT
 from ..models.schemas import (
     Coordinates,
     ErrorResponse,
+    GpxExportRequest,
     LocationSearchResult,
     RouteOptimizationResponse,
     RouteRequest,
     TrafficHeatmapResponse,
 )
+from ..services.cache import cache
 from ..services.route_optimizer import RouteOptimizer
 from ..services.traffic_service import TrafficService
-from ..services.cache import cache
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/routes", tags=["routes"])
-
-NOMINATIM_BASE = "https://nominatim.openstreetmap.org"
 
 _nominatim_client: Optional[httpx.AsyncClient] = None
 
@@ -49,9 +38,6 @@ def _get_nominatim_client() -> httpx.AsyncClient:
         _nominatim_client = httpx.AsyncClient(
             timeout=settings.http_timeout_seconds,
             headers={
-                "User-Agent": "TrafficRouteOptimizerApp/1.1 (contact: admin@trafficoptimizer.local)",
-                "Accept-Language": "en-US,en;q=0.9"
-            }
                 "User-Agent": NOMINATIM_USER_AGENT,
                 "Accept-Language": "en-US,en;q=0.9",
             },
@@ -60,10 +46,30 @@ def _get_nominatim_client() -> httpx.AsyncClient:
 
 
 def _sanitize_query(q: str) -> str:
-    """Strip control characters and limit length to prevent injection/abuse."""
+    """Strip control characters and limit length to prevent injection or abuse."""
     cleaned = re.sub(r'[\x00-\x1f<>"]', " ", q)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned[: settings.max_search_query_length]
+
+
+def _display_address(data: Dict[str, Any], fallback: str) -> str:
+    address = data.get("address", {})
+    keys = (
+        "house_number",
+        "road",
+        "suburb",
+        "city",
+        "town",
+        "village",
+        "county",
+        "state",
+        "country",
+    )
+    parts = [str(address[key]) for key in keys if address.get(key)]
+    return data.get(
+        "display_name",
+        ", ".join(parts) if parts else fallback,
+    )
 
 
 @retry(
@@ -74,7 +80,7 @@ def _sanitize_query(q: str) -> str:
 )
 async def _nominatim_get(path: str, params: Dict[str, Any]) -> httpx.Response:
     client = _get_nominatim_client()
-    response = await client.get(f"{NOMINATIM_BASE}{path}", params=params)
+    response = await client.get(f"{NOMINATIM_BASE_URL}{path}", params=params)
     response.raise_for_status()
     return response
 
@@ -92,19 +98,18 @@ async def optimize_routes_options():
         500: {"model": ErrorResponse, "description": "Internal server error"},
     },
     summary="Optimize routes (multi-stop, multi-mode)",
-    description="""
-    Find the optimal route between origin and destination, with optional
-    ordered intermediate waypoints (multi-stop) and transport mode
-    (driving / cycling / walking). Considers real-time traffic, weather,
-    travel time, distance, safety and fuel efficiency.
-    """
-    summary="Optimize routes between two points",
+    description=(
+        "Find the optimal route between origin and destination, with optional "
+        "ordered intermediate waypoints (multi-stop) and transport mode "
+        "(driving / cycling / walking). Considers real-time traffic, weather, "
+        "travel time, distance, safety and fuel efficiency."
+    ),
 )
-async def optimize_routes(request: RouteRequest):
+async def optimize_routes(request: RouteRequest) -> RouteOptimizationResponse:
     """Optimize routes with multi-factor analysis."""
     optimizer = RouteOptimizer()
     try:
-        result = await optimizer.optimize_routes(
+        return await optimizer.optimize_routes(
             origin=request.origin,
             destination=request.destination,
             waypoints=request.waypoints,
@@ -117,21 +122,17 @@ async def optimize_routes(request: RouteRequest):
             avoid_tolls=request.avoid_tolls,
             avoid_highways=request.avoid_highways,
         )
-        return result
-    except ValueError as ve:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
+    except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(ve),
-        ) from ve
-    except Exception as e:
+            detail=str(exc),
+        ) from exc
+    except Exception as exc:
         logger.exception("Route optimization failed")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Route optimization error: {str(e)}"
-        )
-            detail=f"Route optimization error: {e!s}",
-        ) from e
+            detail=f"Route optimization error: {exc!s}",
+        ) from exc
     finally:
         await optimizer.close()
 
@@ -139,60 +140,58 @@ async def optimize_routes(request: RouteRequest):
 @router.post(
     "/export/gpx",
     summary="Export a route as GPX",
-    description="Generate a GPX 1.1 file from a route path and optional waypoints."
+    description="Generate a GPX 1.1 file from a route path and optional waypoints.",
+)
+async def export_gpx(request: GpxExportRequest) -> Response:
+    """Export route geometry as a downloadable GPX file."""
+    waypoints = "\n".join(
+        f'    <wpt lat="{point.lat}" lon="{point.lon}">'
+        f"<name>Stop {index + 1}</name></wpt>"
+        for index, point in enumerate(request.waypoints)
+    )
+    track_points = "\n".join(
+        f'        <trkpt lat="{point.lat}" lon="{point.lon}"></trkpt>'
+        for point in request.route
+    )
+    gpx = f"""<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="TrafficRouteOptimizer" xmlns="http://www.topografix.com/GPX/1/1">
+  <metadata><name>{escape(request.name)}</name></metadata>
+{waypoints}
+  <trk><name>{escape(request.name)}</name>
+    <trkseg>
+{track_points}
+    </trkseg>
+  </trk>
+</gpx>"""
+    return Response(
+        content=gpx,
+        media_type="application/gpx+xml",
+        headers={"Content-Disposition": 'attachment; filename="route.gpx"'},
+    )
+
+
 @router.get(
     "/heatmap",
     response_model=TrafficHeatmapResponse,
     summary="Get traffic heatmap for a region",
 )
-async def export_gpx(request: GpxExportRequest) -> Response:
-    """Export route geometry as a downloadable GPX file."""
-    try:
-        wpts = "\n".join(
-            f'    <wpt lat="{c.lat}" lon="{c.lon}"><name>Stop {i + 1}</name></wpt>'
-            for i, c in enumerate(request.waypoints)
-        )
-        trkpts = "\n".join(
-            f'        <trkpt lat="{c.lat}" lon="{c.lon}"></trkpt>'
-            for c in request.route
-        )
-        gpx = f'''<?xml version="1.0" encoding="UTF-8"?>
-<gpx version="1.1" creator="TrafficRouteOptimizer" xmlns="http://www.topografix.com/GPX/1/1">
-  <metadata><name>{escape(request.name)}</name></metadata>
-{wpts}
-  <trk><name>{escape(request.name)}</name>
-    <trkseg>
-{trkpts}
-    </trkseg>
-  </trk>
-</gpx>'''
-        return Response(
-            content=gpx,
-            media_type="application/gpx+xml",
-            headers={"Content-Disposition": 'attachment; filename="route.gpx"'}
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"GPX export failed: {str(e)}")
-
-
-@router.get("/heatmap", response_model=TrafficHeatmapResponse)
 async def get_traffic_heatmap(
     north: float = Query(..., description="Northern boundary latitude"),
     south: float = Query(..., description="Southern boundary latitude"),
     east: float = Query(..., description="Eastern boundary longitude"),
     west: float = Query(..., description="Western boundary longitude"),
-):
-    """Get traffic heatmap for bounding box."""
+) -> TrafficHeatmapResponse:
+    """Get traffic heatmap for a bounding box."""
     service = TrafficService()
     try:
         return await service.get_traffic_heatmap(north, south, east, west)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+    except Exception as exc:
+        logger.exception("Traffic heatmap request failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
         await service.close()
 
 
-@router.get("/search", response_model=List[LocationSearchResult])
 @router.get(
     "/search",
     response_model=List[LocationSearchResult],
@@ -201,64 +200,39 @@ async def get_traffic_heatmap(
 async def search_locations(
     q: str = Query(..., min_length=2, description="Search query"),
     limit: int = Query(6, ge=1, le=20),
-):
-    """Search for locations by name using Nominatim (sanitized + cached)."""
+) -> List[LocationSearchResult]:
+    """Search for locations by name using Nominatim (sanitized and cached)."""
     query = _sanitize_query(q)
     if len(query) < 2:
-        raise HTTPException(status_code=422, detail="Query too short after sanitization")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Query too short after sanitization",
+        )
 
     cache_key = f"geocode:{hashlib.sha256(f'{query}:{limit}'.encode()).hexdigest()[:24]}"
     cached = await cache.get_json(cache_key)
     if cached is not None:
         return [LocationSearchResult(**item) for item in cached]
 
+    params: Dict[str, Any] = {
+        "q": query,
+        "format": "jsonv2",
+        "limit": limit,
+        "addressdetails": 1,
+        "namedetails": 1,
+        "extratags": 0,
+    }
     try:
-        params: Dict[str, Any] = {
-            "q": query, "format": "jsonv2", "limit": limit,
-            "addressdetails": 1, "namedetails": 1, "extratags": 0,
-        }
         response = await _nominatim_get("/search", params)
-        response = await client.get(f"{NOMINATIM_BASE_URL}/search", params=params)
-        response.raise_for_status()
-        data = response.json()
-
         results: List[LocationSearchResult] = []
-        for item in data:
-            addr = item.get("address", {})
-            address_parts = [
-                str(addr[k]) for k in
-                ["house_number", "road", "suburb", "city", "town", "village",
-                 "county", "state", "country"] if addr.get(k)
-            ]
-            display_addr = item.get(
-                "display_name", ", ".join(address_parts) if address_parts else "Unknown"
-            )
-            results.append(LocationSearchResult(
-                place_id=str(item.get("place_id", "")),
-                name=item.get("name") or item.get("display_name", "").split(",")[0].strip(),
-                address=display_addr,
-                coordinates=Coordinates(lat=float(item["lat"]), lon=float(item["lon"])),
-                type=item.get("type", item.get("category", "unknown"))
-            ))
-            address_parts: List[str] = []
-            for key in [
-                "house_number", "road", "suburb", "city", "town",
-                "village", "county", "state", "country",
-            ]:
-                if addr.get(key):
-                    address_parts.append(str(addr[key]))
-
-            display_addr = item.get(
-                "display_name",
-                ", ".join(address_parts) if address_parts else "Unknown",
-            )
-
+        for item in response.json():
+            display_address = _display_address(item, "Unknown")
             results.append(
                 LocationSearchResult(
                     place_id=str(item.get("place_id", "")),
                     name=item.get("name")
                     or item.get("display_name", "").split(",")[0].strip(),
-                    address=display_addr,
+                    address=display_address,
                     coordinates=Coordinates(
                         lat=float(item["lat"]),
                         lon=float(item["lon"]),
@@ -266,39 +240,37 @@ async def search_locations(
                     type=item.get("type", item.get("category", "unknown")),
                 )
             )
-
         await cache.set_json(
-            cache_key, [r.model_dump() for r in results], settings.geocode_cache_ttl
+            cache_key,
+            [result.model_dump() for result in results],
+            settings.geocode_cache_ttl,
         )
         return results
-
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 429:
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 429:
             raise HTTPException(
                 status_code=429,
-                detail="Rate limited by geocoding service. Please wait and try again."
-            )
-        raise HTTPException(status_code=502, detail=f"Geocoding service error: {e.response.status_code}")
-    except httpx.RequestError:
-        raise HTTPException(status_code=503, detail="Unable to reach geocoding service.")
-    except HTTPException:
-        raise
-                detail="Rate limited by geocoding service. Please wait a moment and try again.",
-            ) from e
+                detail="Rate limited by geocoding service. Please wait and try again.",
+            ) from exc
         raise HTTPException(
             status_code=502,
-            detail=f"Geocoding service error: {e.response.status_code}",
-        ) from e
-    except httpx.RequestError as e:
+            detail=f"Geocoding service error: {exc.response.status_code}",
+        ) from exc
+    except httpx.RequestError as exc:
         raise HTTPException(
             status_code=503,
-            detail="Unable to reach geocoding service. Please check your connection.",
-        ) from e
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Search failed: {e!s}") from e
+            detail="Unable to reach geocoding service.",
+        ) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Location search failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Search failed: {exc!s}",
+        ) from exc
 
 
-@router.get("/reverse-geocode", response_model=LocationSearchResult)
 @router.get(
     "/reverse-geocode",
     response_model=LocationSearchResult,
@@ -307,86 +279,60 @@ async def search_locations(
 async def reverse_geocode(
     lat: float = Query(..., ge=-90, le=90, description="Latitude"),
     lon: float = Query(..., ge=-180, le=180, description="Longitude"),
-):
-    """Reverse geocode coordinates to address using Nominatim (cached)."""
+) -> LocationSearchResult:
+    """Reverse geocode coordinates to an address using Nominatim."""
     cache_key = f"reverse:{round(lat, 5)}:{round(lon, 5)}"
     cached = await cache.get_json(cache_key)
     if cached is not None:
         return LocationSearchResult(**cached)
 
+    params: Dict[str, Any] = {
+        "lat": lat,
+        "lon": lon,
+        "format": "jsonv2",
+        "addressdetails": 1,
+        "zoom": 18,
+    }
     try:
-        params: Dict[str, Any] = {
-            "lat": lat, "lon": lon, "format": "jsonv2",
-            "addressdetails": 1, "zoom": 18,
-        }
         response = await _nominatim_get("/reverse", params)
-        response = await client.get(f"{NOMINATIM_BASE_URL}/reverse", params=params)
-        response.raise_for_status()
         data = response.json()
-
         if "error" in data:
             raise HTTPException(status_code=404, detail=data["error"])
 
-        addr = data.get("address", {})
-        address_parts = [
-            str(addr[k]) for k in
-            ["house_number", "road", "suburb", "city", "town", "village",
-             "county", "state", "country"] if addr.get(k)
-        ]
-        display_addr = data.get(
-            "display_name", ", ".join(address_parts) if address_parts else "Unknown location"
-        )
+        display_address = _display_address(data, "Unknown location")
         result = LocationSearchResult(
-        address_parts: List[str] = []
-        for key in [
-            "house_number", "road", "suburb", "city", "town",
-            "village", "county", "state", "country",
-        ]:
-            if addr.get(key):
-                address_parts.append(str(addr[key]))
-
-        display_addr = data.get(
-            "display_name",
-            ", ".join(address_parts) if address_parts else "Unknown location",
-        )
-        name = data.get("name") or display_addr.split(",")[0].strip()
-
-        return LocationSearchResult(
             place_id=str(data.get("place_id", "")),
-            name=data.get("name") or display_addr.split(",")[0].strip(),
-            address=display_addr,
+            name=data.get("name") or display_address.split(",")[0].strip(),
+            address=display_address,
             coordinates=Coordinates(lat=lat, lon=lon),
             type=data.get("type", data.get("category", "detected")),
         )
         await cache.set_json(
-            cache_key, result.model_dump(), settings.geocode_cache_ttl
+            cache_key,
+            result.model_dump(),
+            settings.geocode_cache_ttl,
         )
         return result
-
     except HTTPException:
         raise
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 429:
-            raise HTTPException(status_code=429, detail="Rate limited by geocoding service.")
-        raise HTTPException(status_code=502, detail=f"Geocoding service error: {e.response.status_code}")
-    except httpx.RequestError:
-        raise HTTPException(status_code=503, detail="Unable to reach geocoding service.")
-    except HTTPException:
-        raise
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 429:
             raise HTTPException(
                 status_code=429,
-                detail="Rate limited by geocoding service. Please wait a moment and try again.",
-            ) from e
+                detail="Rate limited by geocoding service. Please wait and try again.",
+            ) from exc
         raise HTTPException(
             status_code=502,
-            detail=f"Geocoding service error: {e.response.status_code}",
-        ) from e
-    except httpx.RequestError as e:
+            detail=f"Geocoding service error: {exc.response.status_code}",
+        ) from exc
+    except httpx.RequestError as exc:
         raise HTTPException(
             status_code=503,
-            detail="Unable to reach geocoding service. Please check your connection.",
-        ) from e
-    except Exception as e:
+            detail="Unable to reach geocoding service.",
+        ) from exc
+    except Exception as exc:
+        logger.exception("Reverse geocoding failed")
         raise HTTPException(
-            status_code=500, detail=f"Reverse geocoding failed: {e!s}"
-        ) from e
+            status_code=500,
+            detail=f"Reverse geocoding failed: {exc!s}",
+        ) from exc

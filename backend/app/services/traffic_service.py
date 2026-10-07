@@ -1,23 +1,12 @@
-"""Production traffic data service using TomTom Traffic API."""
+"""Traffic data service using TomTom Traffic API."""
 import logging
 import math
 import random
-from typing import Any, Dict, List, Optional
-
-import httpx
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_exception_type,
-)
-"""Traffic data service using TomTom Traffic API."""
-import logging
-import random
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 import httpx
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from ..core.config import settings
 from .cache import cache
@@ -39,12 +28,6 @@ class TrafficService:
 
     BASE_URL = "https://api.tomtom.com/traffic/services/4"
 
-    def __init__(self) -> None:
-        self.api_key = settings.tomtom_api_key
-        self.client = httpx.AsyncClient(
-            timeout=settings.http_timeout_seconds,
-            headers={"User-Agent": "TrafficRouteOptimizer/1.1"},
-        )
     def __init__(self, client: Optional[httpx.AsyncClient] = None):
         self.api_key = settings.tomtom_api_key
         self._owns_client = client is None
@@ -76,7 +59,7 @@ class TrafficService:
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=8),
         retry=retry_if_exception_type(httpx.TransportError),
-        reraise=False,  # On final failure return None so caller can estimate
+        reraise=True,
     )
     async def _fetch_flow(self, lat: float, lon: float) -> Optional[Dict[str, Any]]:
         """Fetch TomTom flow segment data. Returns None on persistent failure."""
@@ -93,10 +76,51 @@ class TrafficService:
             return None
         return response.json()
 
+    async def _get_flow_data(
+        self, cache_key: str, lat: float, lon: float
+    ) -> Optional[Dict[str, Any]]:
+        cached = await cache.get_json(cache_key)
+        if isinstance(cached, dict):
+            return cast(Dict[str, Any], cached)
+
+        try:
+            data = await self._fetch_flow(lat, lon)
+        except httpx.TransportError as exc:
+            logger.debug("TomTom request failed at (%s, %s): %s", lat, lon, exc)
+            return None
+
+        if data is None:
+            return None
+        flow = data.get("flowSegmentData")
+        if not isinstance(flow, dict):
+            return None
+
+        typed_flow = cast(Dict[str, Any], flow)
+        await cache.set_json(cache_key, typed_flow, settings.traffic_cache_ttl)
+        return typed_flow
+
+    @staticmethod
+    def _flow_speeds(flow: Dict[str, Any]) -> Optional[tuple[float, float]]:
+        try:
+            current_speed = float(flow.get("currentSpeed", 60))
+            free_flow_speed = float(flow.get("freeFlowSpeed", current_speed))
+        except (TypeError, ValueError):
+            logger.warning("TomTom returned invalid speed values: %r", flow)
+            return None
+
+        if (
+            not math.isfinite(current_speed)
+            or not math.isfinite(free_flow_speed)
+            or current_speed < 0
+            or free_flow_speed < 0
+        ):
+            logger.warning("TomTom returned out-of-range speed values: %r", flow)
+            return None
+        return current_speed, free_flow_speed
+
     async def get_traffic_for_route(
         self,
-        path: List[Coordinates]
-        self, path: List[Coordinates]
+        path: List[Coordinates],
     ) -> List[TrafficSegment]:
         """Get traffic data for route segments (sampled on long paths)."""
         if not self.api_key:
@@ -117,90 +141,36 @@ class TrafficService:
             mid_lon = (start.lon + end.lon) / 2
 
             cache_key = f"traffic:{round(mid_lat, 3)}:{round(mid_lon, 3)}"
-            flow = await cache.get_json(cache_key)
+            flow = await self._get_flow_data(cache_key, mid_lat, mid_lon)
+            speeds = self._flow_speeds(flow) if flow is not None else None
 
-            if flow is None:
-                try:
-                    data = await self._fetch_flow(mid_lat, mid_lon)
-                except httpx.TransportError:
-                    data = None
-                if data is not None:
-                    flow = data.get("flowSegmentData", {})
-                    await cache.set_json(
-                        cache_key, flow, settings.traffic_cache_ttl
-                    )
-
-            if flow:
-                current_speed = flow.get("currentSpeed", 60)
-                free_flow = flow.get("freeFlowSpeed", current_speed)
+            if flow is not None and speeds is not None:
+                current_speed, free_flow = speeds
                 ratio = current_speed / free_flow if free_flow > 0 else 1.0
 
                 # Calculate delay
-                segment_dist = self._haversine_distance(start, end)
-                time_free = (segment_dist / free_flow) * 60 if free_flow > 0 else 0
-                time_current = (segment_dist / current_speed) * 60 if current_speed > 0 else 0
-                delay = max(0, time_current - time_free)
-
-                segments.append(TrafficSegment(
-                    segment_id=f"seg_{i}",
-                    start_coords=start,
-                    end_coords=end,
-                    current_speed=round(current_speed, 1),
-                    free_flow_speed=round(free_flow, 1),
-                    congestion_level=self._determine_congestion(ratio),
-                    delay_minutes=round(delay, 1),
-                    incident_count=1 if flow.get("roadClosure", False) else 0
-                ))
-            else:
-                # Fallback: estimate from segment characteristics
-            try:
-                params = {
-                    "key": self.api_key,
-                    "point": f"{mid_lat},{mid_lon}",
-                    "unit": "KMPH",
-                }
-                response = await self.client.get(
-                    f"{self.BASE_URL}/flowSegmentData/absolute/10/json",
-                    params=params,
+                segment_dist = haversine_distance_km(start, end)
+                time_free = (segment_dist / free_flow) * 60 if free_flow > 0 else 0.0
+                time_current = (
+                    (segment_dist / current_speed) * 60
+                    if current_speed > 0
+                    else 0.0
                 )
-                if response.status_code == 200:
-                    data = response.json()
-                    flow = data.get("flowSegmentData", {})
-                    current_speed = float(flow.get("currentSpeed", 60))
-                    free_flow = float(flow.get("freeFlowSpeed", current_speed))
-                    ratio = current_speed / free_flow if free_flow > 0 else 1.0
-                    segment_dist = haversine_distance_km(start, end)
-                    time_free = (
-                        (segment_dist / free_flow) * 60 if free_flow > 0 else 0
+                delay = max(0.0, time_current - time_free)
+
+                segments.append(
+                    TrafficSegment(
+                        segment_id=f"seg_{i}",
+                        start_coords=start,
+                        end_coords=end,
+                        current_speed=round(current_speed, 1),
+                        free_flow_speed=round(free_flow, 1),
+                        congestion_level=self._determine_congestion(ratio),
+                        delay_minutes=round(delay, 1),
+                        incident_count=1 if flow.get("roadClosure", False) else 0,
                     )
-                    time_current = (
-                        (segment_dist / current_speed) * 60
-                        if current_speed > 0
-                        else 0
-                    )
-                    delay = max(0.0, time_current - time_free)
-                    segments.append(
-                        TrafficSegment(
-                            segment_id=f"seg_{i}",
-                            start_coords=start,
-                            end_coords=end,
-                            current_speed=round(current_speed, 1),
-                            free_flow_speed=round(free_flow, 1),
-                            congestion_level=self._determine_congestion(ratio),
-                            delay_minutes=round(delay, 1),
-                            incident_count=(
-                                1 if flow.get("roadClosure", False) else 0
-                            ),
-                        )
-                    )
-                else:
-                    logger.debug(
-                        "TomTom flowSegmentData status %s; using estimate",
-                        response.status_code,
-                    )
-                    segments.append(self._estimate_segment(start, end, i))
-            except httpx.HTTPError as exc:
-                logger.debug("TomTom request failed for segment %s: %s", i, exc)
+                )
+            else:
                 segments.append(self._estimate_segment(start, end, i))
 
         return segments
@@ -240,10 +210,6 @@ class TrafficService:
     async def get_traffic_heatmap(
         self, north: float, south: float, east: float, west: float
     ) -> TrafficHeatmapResponse:
-        """Generate traffic heatmap using TomTom Flow Segment Data or estimation."""
-        points: list[TrafficHeatmapPoint] = []
-        lat_step = (north - south) / 12
-        lon_step = (east - west) / 12
         """Generate a coarse traffic heatmap for a bounding box."""
         points: List[TrafficHeatmapPoint] = []
         lat_step = (north - south) / 12 if north != south else 0.01
@@ -259,50 +225,17 @@ class TrafficService:
 
                 if self.api_key:
                     cache_key = f"traffic:{round(lat, 3)}:{round(lon, 3)}"
-                    flow = await cache.get_json(cache_key)
-                    if flow is None:
-                        try:
-                            data = await self._fetch_flow(lat, lon)
-                        except httpx.TransportError:
-                            data = None
-                        if data is not None:
-                            flow = data.get("flowSegmentData", {})
-                            await cache.set_json(
-                                cache_key, flow, settings.traffic_cache_ttl
-                            )
-
-                    if flow:
-                        current = flow.get("currentSpeed", 60)
-                        free = flow.get("freeFlowSpeed", 60)
-                        ratio = current / free if free > 0 else 1.0
-                        intensity = max(0, min(1, 1 - ratio))
-                        speed = current
-                intensity = 0.3
-                speed = 60.0
-
-                if self.api_key:
-                    try:
-                        params = {
-                            "key": self.api_key,
-                            "point": f"{lat},{lon}",
-                            "unit": "KMPH",
-                        }
-                        response = await self.client.get(
-                            f"{self.BASE_URL}/flowSegmentData/absolute/10/json",
-                            params=params,
-                            timeout=5.0,
+                    flow = await self._get_flow_data(cache_key, lat, lon)
+                    speeds = self._flow_speeds(flow) if flow is not None else None
+                    if speeds is not None:
+                        current_speed, free_flow_speed = speeds
+                        ratio = (
+                            current_speed / free_flow_speed
+                            if free_flow_speed > 0
+                            else 1.0
                         )
-                        if response.status_code == 200:
-                            data = response.json()
-                            flow = data.get("flowSegmentData", {})
-                            current = float(flow.get("currentSpeed", 60))
-                            free = float(flow.get("freeFlowSpeed", 60))
-                            ratio = current / free if free > 0 else 1.0
-                            intensity = max(0.0, min(1.0, 1 - ratio))
-                            speed = current
-                    except httpx.HTTPError:
-                        pass
-
+                        intensity = max(0.0, min(1.0, 1.0 - ratio))
+                        speed = current_speed
                 points.append(
                     TrafficHeatmapPoint(
                         lat=round(lat, 6),
@@ -320,14 +253,6 @@ class TrafficService:
                 "west": west,
             },
             points=points,
-            timestamp=__import__("datetime").datetime.now(
-                __import__("datetime").timezone.utc
-            ),
-            total_incidents=0
-        )
-
-    async def close(self) -> None:
-        await self.client.aclose()
             timestamp=datetime.now(timezone.utc),
             total_incidents=0,
         )

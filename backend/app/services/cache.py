@@ -26,9 +26,9 @@ class CacheService:
     async def connect(self) -> None:
         """Try to establish the Redis connection. Never raises."""
         try:
-            import redis.asyncio as aioredis  # type: ignore
+            from redis.asyncio.client import Redis
 
-            self._redis = aioredis.from_url(
+            self._redis = Redis.from_url(  # type: ignore[reportUnknownMemberType]
                 settings.redis_url,
                 decode_responses=True,
                 max_connections=settings.redis_max_connections,

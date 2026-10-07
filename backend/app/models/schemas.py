@@ -1,7 +1,7 @@
 """Pydantic models for request/response validation."""
 from pydantic import BaseModel, Field, field_validator
-from pydantic import BaseModel, Field, ConfigDict
-from typing import List, Optional, Dict, Any
+from pydantic import ConfigDict
+from typing import List, Optional, Dict
 from enum import Enum
 from datetime import datetime
 
@@ -28,6 +28,8 @@ class NavigationInstruction(BaseModel):
     duration_s: float = Field(..., description="Duration of this step")
     maneuver_type: str = Field(..., description="Maneuver type (turn, merge, arrive...)")
     street_name: Optional[str] = Field(None, description="Street/road name if known")
+
+
 class VehicleType(str, Enum):
     """Supported vehicle types for fuel modelling."""
     CAR = "car"
@@ -43,7 +45,7 @@ class RouteRequest(BaseModel):
 
     # Multi-stop: optional intermediate stops visited in order
     waypoints: List[Coordinates] = Field(
-        default_factory=list,
+        default_factory=lambda: list[Coordinates](),
         description="Optional intermediate stops, visited in order",
     )
 
@@ -76,11 +78,6 @@ class RouteRequest(BaseModel):
                 f"Too many waypoints: {len(v)} (max {settings.max_waypoints})"
             )
         return v
-
-    class Config:
-        json_schema_extra: Dict[str, Any] = {
-    avoid_tolls: bool = False
-    avoid_highways: bool = False
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -245,4 +242,4 @@ class GpxExportRequest(BaseModel):
     """Request model for GPX export."""
     name: str = Field("Traffic Route Optimizer Export", max_length=120)
     route: List[Coordinates] = Field(..., min_length=2)
-    waypoints: List[Coordinates] = Field(default_factory=list)
+    waypoints: List[Coordinates] = Field(default_factory=lambda: list[Coordinates]())

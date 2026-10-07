@@ -1,10 +1,6 @@
-"""Production route optimization engine with real routing APIs."""
-import hashlib
-import math
-from typing import List, Dict, Tuple, Any, Optional
-from datetime import datetime, timezone
 """Multi-factor route optimization engine (OSRM geometry + live traffic/weather)."""
 import logging
+import hashlib
 import math
 import uuid
 from datetime import datetime, timezone
@@ -28,7 +24,6 @@ from ..core.constants import (
     DISTANCE_SCORE_ANCHOR_KM,
     FUEL_RATES_L_PER_100KM,
     FUEL_SCORE_ANCHOR_L,
-    OSRM_DRIVING_URL,
     TIME_SCORE_ANCHOR_MIN,
     WEATHER_WEIGHT_BONUS,
 )
@@ -78,22 +73,6 @@ class RouteOptimizer:
 
     CO2_PER_LITER = 2.31
 
-    def __init__(self):
-        self.weather_service = WeatherService()
-        self.traffic_service = TrafficService()
-        self.routing_client = httpx.AsyncClient(
-            timeout=30.0,
-            headers={"User-Agent": "TrafficRouteOptimizer/1.1"},
-        )
-
-    def _haversine_distance(self, p1: Coordinates, p2: Coordinates) -> float:
-        R = 6371
-        lat1, lon1 = math.radians(p1.lat), math.radians(p1.lon)
-        lat2, lon2 = math.radians(p2.lat), math.radians(p2.lon)
-        dlat = lat2 - lat1
-        dlon = lon2 - lon1
-        a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
-        return R * 2 * math.asin(math.sqrt(a))
     def __init__(
         self,
         weather_service: Optional[WeatherService] = None,
@@ -142,41 +121,33 @@ class RouteOptimizer:
         origin: Coordinates,
         destination: Coordinates,
         waypoints: List[Coordinates],
+        avoid_tolls: bool = False,
+        avoid_highways: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Query OSRM for real road-following routes (driving profile)."""
-        # Multi-stop: OSRM visits coordinates in the order provided
         all_points = [origin, *waypoints, destination]
         coords = ";".join(f"{p.lon},{p.lat}" for p in all_points)
         url = f"{self.OSRM_URL}/driving/{coords}"
-
-        avoid_tolls: bool = False,
-        avoid_highways: bool = False,
-    ) -> List[Dict[str, Any]]:
-        """Fetch real road-following routes from OSRM."""
-        coords = f"{origin.lon},{origin.lat};{destination.lon},{destination.lat}"
-        url = f"{OSRM_DRIVING_URL}/{coords}"
         params: Dict[str, Any] = {
             "overview": "full",
             "geometries": "geojson",
             "steps": "true",
             "alternatives": "3" if not waypoints else "false",
         }
-            "alternatives": "3",
-        }
         exclude = self._osrm_exclude_param(avoid_tolls, avoid_highways)
         if exclude:
             params["exclude"] = exclude
-
         try:
-            response = await self.routing_client.get(url, params=params, timeout=15.0)
-            if response.status_code != 200:
-                logger.warning(
-                    "OSRM returned %s for primary route request", response.status_code
-                )
-                return []
-
-        response = await self.routing_client.get(url, params=params, timeout=15.0)
+            response = await self.routing_client.get(
+                url,
+                params=params,
+                timeout=15.0,
+            )
+        except httpx.HTTPError as exc:
+            logger.warning("OSRM request failed: %s", exc)
+            return None
         if response.status_code != 200:
+            logger.warning("OSRM returned %s for route request", response.status_code)
             return None
         return response.json()
 
@@ -267,6 +238,8 @@ class RouteOptimizer:
         destination: Coordinates,
         waypoints: List[Coordinates],
         mode: TransportMode,
+        avoid_tolls: bool = False,
+        avoid_highways: bool = False,
     ) -> Tuple[List[Dict[str, Any]], List[str]]:
         """Fetch real road-following routes.
 
@@ -276,7 +249,13 @@ class RouteOptimizer:
         sources: List[str] = []
 
         if mode == TransportMode.DRIVING:
-            data = await self._request_osrm(origin, destination, waypoints)
+            data = await self._request_osrm(
+                origin,
+                destination,
+                waypoints,
+                avoid_tolls=avoid_tolls,
+                avoid_highways=avoid_highways,
+            )
             if data:
                 sources.append("OSRM")
                 routes: List[Dict[str, Any]] = []
@@ -293,7 +272,11 @@ class RouteOptimizer:
                 # If OSRM returned fewer than 3 routes, try offset-via routes
                 if 0 < len(routes) < 3 and not waypoints:
                     routes = await self._augment_with_via_routes(
-                        origin, destination, routes
+                        origin,
+                        destination,
+                        routes,
+                        avoid_tolls=avoid_tolls,
+                        avoid_highways=avoid_highways,
                     )
                 if routes:
                     return routes, sources
@@ -321,8 +304,12 @@ class RouteOptimizer:
         origin: Coordinates,
         destination: Coordinates,
         routes: List[Dict[str, Any]],
+        avoid_tolls: bool = False,
+        avoid_highways: bool = False,
     ) -> List[Dict[str, Any]]:
         """Create additional real-road routes via offset intermediate waypoints."""
+        if not routes or not routes[0]["path"]:
+            return routes
         base_path = routes[0]["path"]
         mid_idx = len(base_path) // 2
         mid_point = base_path[mid_idx]
@@ -332,7 +319,13 @@ class RouteOptimizer:
             if len(routes) >= 3:
                 break
             via = Coordinates(lat=mid_point.lat + off_lat, lon=mid_point.lon + off_lon)
-            data = await self._request_osrm(origin, destination, [via])
+            data = await self._request_osrm(
+                origin,
+                destination,
+                [via],
+                avoid_tolls=avoid_tolls,
+                avoid_highways=avoid_highways,
+            )
             if data and data.get("routes"):
                 route_item = data["routes"][0]
                 coords_list = route_item.get("geometry", {}).get("coordinates", [])
@@ -343,69 +336,6 @@ class RouteOptimizer:
                     "instructions": self._parse_osrm_instructions(route_item),
                 })
         return routes
-            for route_item in data.get("routes", []):
-                geometry = route_item.get("geometry", {})
-                coords_list = geometry.get("coordinates", [])
-                path = [Coordinates(lat=c[1], lon=c[0]) for c in coords_list]
-                routes.append(
-                    {
-                        "path": path,
-                        "distance_m": route_item.get("distance", 0),
-                        "duration_s": route_item.get("duration", 0),
-                    }
-                )
-
-            # Pad to 3 alternatives with via-point variants when OSRM returns fewer
-            if 0 < len(routes) < 3:
-                base_path = routes[0]["path"]
-                mid_idx = len(base_path) // 2
-                mid_point = base_path[mid_idx]
-                offsets = [(0.003, 0.003), (-0.003, -0.003)]
-                for off_lat, off_lon in offsets:
-                    if len(routes) >= 3:
-                        break
-                    via_lat = mid_point.lat + off_lat
-                    via_lon = mid_point.lon + off_lon
-                    via_coords = (
-                        f"{origin.lon},{origin.lat};"
-                        f"{via_lon},{via_lat};"
-                        f"{destination.lon},{destination.lat}"
-                    )
-                    via_url = f"{OSRM_DRIVING_URL}/{via_coords}"
-                    via_params: Dict[str, Any] = {
-                        "overview": "full",
-                        "geometries": "geojson",
-                    }
-                    if exclude:
-                        via_params["exclude"] = exclude
-                    try:
-                        via_res = await self.routing_client.get(
-                            via_url, params=via_params, timeout=10.0
-                        )
-                    except httpx.HTTPError as exc:
-                        logger.debug("OSRM via-route request failed: %s", exc)
-                        continue
-                    if via_res.status_code != 200:
-                        continue
-                    vdata = via_res.json()
-                    if not vdata.get("routes"):
-                        continue
-                    vroute = vdata["routes"][0]
-                    vcoords = vroute.get("geometry", {}).get("coordinates", [])
-                    routes.append(
-                        {
-                            "path": [
-                                Coordinates(lat=c[1], lon=c[0]) for c in vcoords
-                            ],
-                            "distance_m": vroute.get("distance", 0),
-                            "duration_s": vroute.get("duration", 0),
-                        }
-                    )
-
-            return routes
-        except httpx.HTTPError as exc:
-            logger.warning("OSRM request failed: %s", exc)
-            return []
 
     def _generate_route_path(
         self,
@@ -619,7 +549,6 @@ class RouteOptimizer:
         Supports multi-stop trips via ordered waypoints and
         transport-mode-aware routing (driving/cycling/walking).
         """
-        """Optimize routes with real geometry, traffic, and weather."""
         start_time = datetime.now(timezone.utc)
         waypoints = waypoints or []
 
@@ -638,13 +567,12 @@ class RouteOptimizer:
         else:
             vehicle_key = str(vehicle_type)
 
-        # Fetch real road paths (mode-aware, multi-stop aware)
-        real_routes, routing_sources = await self._get_real_routes(
-            origin, destination, waypoints, transport_mode
         weather = await self.weather_service.get_weather(origin)
-        osrm_routes = await self._get_real_routes_from_osrm(
+        real_routes, routing_sources = await self._get_real_routes(
             origin,
             destination,
+            waypoints,
+            transport_mode,
             avoid_tolls=avoid_tolls,
             avoid_highways=avoid_highways,
         )
@@ -682,7 +610,6 @@ class RouteOptimizer:
                 distance_km = real_route["distance_m"] / 1000
                 base_time_min = real_route["duration_s"] / 60
                 instructions = real_route.get("instructions", [])
-                base_time_min: Optional[float] = real_route["duration_s"] / 60
             else:
                 path = self._generate_route_path(
                     origin, destination, deviation=config["deviation"]
@@ -730,20 +657,9 @@ class RouteOptimizer:
                 traffic_segments=traffic_segments,
                 instructions=instructions,
                 warnings=[],
-                insights=[]
-            routes.append(
-                RouteAlternative(
-                    route_id=config["id"],
-                    name=config["name"],
-                    description=config["description"],
-                    color=config["color"],
-                    path=path,
-                    metrics=metrics,
-                    traffic_segments=traffic_segments,
-                    warnings=[],
-                    insights=[],
-                )
+                insights=[],
             )
+            routes.append(route)
 
         weights = {
             "time": time_weight,
@@ -772,8 +688,6 @@ class RouteOptimizer:
             worst_route.metrics.fuel_cost_usd - routes[0].metrics.fuel_cost_usd
         )
 
-        processing_time = int((datetime.now(timezone.utc) - start_time).total_seconds() * 1000)
-
         data_sources = ["OpenWeatherMap", "OpenStreetMap/Nominatim", *routing_sources]
         processing_time = int(
             (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
@@ -790,12 +704,7 @@ class RouteOptimizer:
             time_saved_vs_worst_min=round(max(0.0, time_saved), 1),
             fuel_saved_vs_worst_usd=round(max(0.0, fuel_saved), 2),
             processing_time_ms=processing_time,
-            data_sources=[
-                "OpenWeatherMap",
-                "TomTom",
-                "OpenStreetMap/Nominatim",
-                "OSRM",
-            ],
+            data_sources=data_sources,
         )
 
         # Cache the full response for identical future requests
@@ -804,7 +713,6 @@ class RouteOptimizer:
         )
         return response
 
-    async def close(self):
     async def close(self) -> None:
         await self.weather_service.close()
         await self.traffic_service.close()

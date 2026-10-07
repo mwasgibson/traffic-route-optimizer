@@ -1,20 +1,14 @@
-"""Production weather data service using OpenWeatherMap API."""
+"""Weather data service using OpenWeatherMap API."""
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import httpx
 from tenacity import (
     retry,
+    retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
-    retry_if_exception_type,
 )
-"""Weather data service using OpenWeatherMap API."""
-import logging
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional, Tuple
-
-import httpx
 
 from ..core.config import settings
 from .cache import cache
@@ -28,29 +22,13 @@ class WeatherService:
 
     BASE_URL = "https://api.openweathermap.org/data/2.5"
 
-    def __init__(self) -> None:
-        self.api_key = settings.openweather_api_key
-        self.client = httpx.AsyncClient(
-            timeout=settings.http_timeout_seconds,
-            headers={"User-Agent": "TrafficRouteOptimizer/1.1"},
-        )
-
-    def _get_cache_key(self, lat: float, lon: float) -> str:
-        return f"weather:{round(lat, 2)}:{round(lon, 2)}"
     def __init__(self, client: Optional[httpx.AsyncClient] = None):
         self.api_key = settings.openweather_api_key
         self._owns_client = client is None
         self.client = client or httpx.AsyncClient(timeout=15.0)
-        self._cache: Dict[str, Tuple[WeatherCondition, datetime]] = {}
 
     def _get_cache_key(self, lat: float, lon: float) -> str:
-        return f"{round(lat, 2)}:{round(lon, 2)}"
-
-    def _is_cache_valid(self, cached_time: datetime) -> bool:
-        return (
-            datetime.now(timezone.utc) - cached_time
-            < timedelta(seconds=settings.weather_cache_ttl)
-        )
+        return f"weather:{round(lat, 2)}:{round(lon, 2)}"
 
     def _calculate_impact_score(self, data: Dict[str, Any]) -> float:
         """Weather impact on driving (0–10, higher = worse)."""
@@ -123,7 +101,6 @@ class WeatherService:
 
     async def get_weather(self, coords: Coordinates) -> WeatherCondition:
         """Fetch real weather data from OpenWeatherMap (cached + retried)."""
-        """Fetch current weather; raises if API key is missing."""
         if not self.api_key:
             raise ValueError(
                 "OpenWeatherMap API key is required. "
@@ -155,37 +132,6 @@ class WeatherService:
 
         weather = self._to_weather_condition(data)
         await cache.set_json(cache_key, weather.model_dump(), settings.weather_cache_ttl)
-        return weather
-
-    async def close(self) -> None:
-        await self.client.aclose()
-        if cache_key in self._cache:
-            weather, cached_time = self._cache[cache_key]
-            if self._is_cache_valid(cached_time):
-                return weather
-
-        params: Dict[str, Any] = {
-            "lat": coords.lat,
-            "lon": coords.lon,
-            "appid": self.api_key,
-            "units": "metric",
-        }
-
-        response = await self.client.get(f"{self.BASE_URL}/weather", params=params)
-        response.raise_for_status()
-        data = response.json()
-
-        weather = WeatherCondition(
-            temperature=round(data["main"]["temp"], 1),
-            humidity=data["main"]["humidity"],
-            visibility=round(data.get("visibility", 10000) / 1000, 1),
-            rainfall=round((data.get("rain") or {}).get("1h", 0) or 0, 1),
-            wind_speed=round(data.get("wind", {}).get("speed", 0) * 3.6, 1),
-            condition=data["weather"][0]["description"].title(),
-            impact_score=self._calculate_impact_score(data),
-        )
-
-        self._cache[cache_key] = (weather, datetime.now(timezone.utc))
         return weather
 
     async def close(self) -> None:

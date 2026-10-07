@@ -2,7 +2,6 @@
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -42,7 +41,7 @@ class TestUpgrades:
         assert response.status_code == 422
 
     def test_gpx_export(self):
-        payload = {
+        payload: dict[str, Any] = {
             "name": "Test Route",
             "route": [{"lat": -1.2921, "lon": 36.8219}, {"lat": -1.30, "lon": 36.85}],
             "waypoints": [{"lat": -1.296, "lon": 36.83}],
@@ -194,7 +193,7 @@ class TestRouteOptimization:
 
 class TestHeatmap:
     def test_traffic_heatmap(self):
-        mock_heatmap = {
+        mock_heatmap: dict[str, Any]= {
             "bounds": {"north": -1.2, "south": -1.4, "east": 37.0, "west": 36.7},
             "points": [
                 {"lat": -1.3, "lon": 36.8, "intensity": 0.4, "speed": 50.0}
@@ -223,7 +222,7 @@ class TestHeatmap:
 
 class TestSearch:
     def test_search_locations_mocked(self):
-        mock_json = [
+        mock_json: list[dict[str, Any]] = [
             {
                 "place_id": "1",
                 "name": "Nairobi",
@@ -248,7 +247,7 @@ class TestSearch:
                 "/api/v1/routes/search", params={"q": "nairobi"}
             )
             assert response.status_code == 200
-            data = response.json()
+            data: list[dict[str, Any]] = response.json()
             assert isinstance(data, list)
             assert len(data) == 1
             assert data[0]["name"] == "Nairobi"

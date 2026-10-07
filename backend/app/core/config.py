@@ -69,8 +69,6 @@ class Settings(BaseSettings):
             return [i.strip() for i in v.split(",") if i.strip()]
         return v
 
-
-settings = Settings()
     @property
     def cors_origins_list(self) -> List[str]:
         """Always return a list of origins."""
