@@ -1,5 +1,6 @@
 """Pydantic models for request/response validation."""
 from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional, Dict, Any
 from enum import Enum
 from datetime import datetime
@@ -27,6 +28,12 @@ class NavigationInstruction(BaseModel):
     duration_s: float = Field(..., description="Duration of this step")
     maneuver_type: str = Field(..., description="Maneuver type (turn, merge, arrive...)")
     street_name: Optional[str] = Field(None, description="Street/road name if known")
+class VehicleType(str, Enum):
+    """Supported vehicle types for fuel modelling."""
+    CAR = "car"
+    MOTORCYCLE = "motorcycle"
+    TRUCK = "truck"
+    BUS = "bus"
 
 
 class RouteRequest(BaseModel):
@@ -46,8 +53,10 @@ class RouteRequest(BaseModel):
     safety_weight: int = Field(90, ge=0, le=100, description="Weight for safety")
     fuel_weight: int = Field(75, ge=0, le=100, description="Weight for fuel efficiency")
 
-    # Vehicle type affects fuel calculation
-    vehicle_type: str = Field("car", description="car, motorcycle, truck, bus")
+    vehicle_type: VehicleType = Field(
+        VehicleType.CAR,
+        description="Vehicle type used for fuel and CO2 estimates",
+    )
 
     # Routing profile
     transport_mode: TransportMode = Field(
@@ -70,6 +79,11 @@ class RouteRequest(BaseModel):
 
     class Config:
         json_schema_extra: Dict[str, Any] = {
+    avoid_tolls: bool = False
+    avoid_highways: bool = False
+
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "origin": {"lat": -1.2921, "lon": 36.8219},
                 "destination": {"lat": -1.3192, "lon": 36.9278},
@@ -81,9 +95,10 @@ class RouteRequest(BaseModel):
                 "vehicle_type": "car",
                 "transport_mode": "driving",
                 "avoid_tolls": False,
-                "avoid_highways": False
+                "avoid_highways": False,
             }
         }
+    )
 
 
 class TrafficCondition(str, Enum):
@@ -104,8 +119,8 @@ class WeatherCondition(BaseModel):
     condition: str = Field(..., description="Weather condition description")
     impact_score: float = Field(..., ge=0, le=10, description="Impact on driving (0-10)")
 
-    class Config:
-        json_schema_extra: Dict[str, Any] = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "temperature": 24.0,
                 "humidity": 65,
@@ -113,9 +128,10 @@ class WeatherCondition(BaseModel):
                 "rainfall": 0.0,
                 "wind_speed": 12.0,
                 "condition": "Partly cloudy",
-                "impact_score": 2.1
+                "impact_score": 2.1,
             }
         }
+    )
 
 
 class TrafficSegment(BaseModel):

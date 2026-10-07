@@ -8,7 +8,8 @@ FastAPI-based backend with **real API integrations** for production use.
 | --------- | --------- | ----------- | --------- |
 | **OpenWeatherMap** | Current weather conditions | 1,000 calls/day | [openweathermap.org/api](https://openweathermap.org/api) |
 | **TomTom** | Real-time traffic flow data | 2,500 transactions/day | [developer.tomtom.com](https://developer.tomtom.com) |
-| **OpenRouteService** | Route directions & geometry | 2,000 directions/day | [openrouteservice.org](https://openrouteservice.org/dev/#/login) |
+| **OSRM** | Route directions & geometry | Public demo | [project-osrm.org](http://project-osrm.org/) |
+| **OpenRouteService** | Optional future routing | 2,000 directions/day | [openrouteservice.org](https://openrouteservice.org/dev/#/login) |
 | **OpenStreetMap/Nominatim** | Geocoding & reverse geocoding | 1 request/second | Built-in (no key needed) |
 
 ## Quick Start
@@ -56,7 +57,7 @@ app/
 └── services/
     ├── weather_service.py    # OpenWeatherMap (REAL)
     ├── traffic_service.py    # TomTom Traffic (REAL)
-    └── route_optimizer.py    # OpenRouteService + scoring (REAL)
+    └── route_optimizer.py    # OSRM geometry + multi-factor scoring
 ```
 
 ## Production Deployment
