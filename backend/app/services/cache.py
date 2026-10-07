@@ -37,7 +37,7 @@ class CacheService:
             )
             await self._redis.ping()
             self._redis_available = True
-            logger.info("Redis cache connected: %s", settings.redis_url)
+            logger.info("Redis cache connected")
         except Exception as exc:  # pragma: no cover - depends on environment
             self._redis = None
             self._redis_available = False
