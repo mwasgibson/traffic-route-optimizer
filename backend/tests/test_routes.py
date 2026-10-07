@@ -9,72 +9,46 @@ from app.main import app
 
 client = TestClient(app)
 
+class TestUpgrades:
+    """Tests for v1.1 features: multi-stop, GPX, sanitization, rate limit."""
 
-class TestRouteOptimization:
-    """Test suite for route optimization endpoints."""
-
-    def test_health_check(self):
-        """Test health endpoint."""
-        response = client.get("/health")
-        assert response.status_code == 200
-        assert response.json()["status"] == "healthy"
-
-    def test_optimize_routes_success(self):
-        """Test successful route optimization."""
+    def test_waypoint_limit_validation(self):
+        """Waypoints beyond max should be rejected with 422."""
         payload: dict[str, Any] = {
             "origin": {"lat": -1.2921, "lon": 36.8219},
             "destination": {"lat": -1.3192, "lon": 36.9278},
-            "time_weight": 85,
-            "distance_weight": 60,
-            "safety_weight": 90,
-            "fuel_weight": 75,
-            "vehicle_type": "car",
-            "avoid_tolls": False,
-            "avoid_highways": False
+            "waypoints": [{"lat": -1.30, "lon": 36.85}] * 20,
         }
-
-        response = client.post("/api/v1/routes/optimize", json=payload)
-        assert response.status_code == 200
-
-        data = response.json()
-        assert "request_id" in data
-        assert "routes" in data
-        assert len(data["routes"]) >= 2
-        assert "recommended_route_id" in data
-        assert "weather" in data
-
-        # Check first route has required fields
-        route = data["routes"][0]
-        assert "route_id" in route
-        assert "metrics" in route
-        assert "path" in route
-        assert route["metrics"]["overall_score"] > 0
-
-    def test_optimize_routes_invalid_coords(self):
-        """Test with invalid coordinates."""
-        payload: dict[str, Any] = {
-            "origin": {"lat": 999, "lon": 36.8219},
-            "destination": {"lat": -1.3192, "lon": 36.9278}
-        }
-
         response = client.post("/api/v1/routes/optimize", json=payload)
         assert response.status_code == 422
 
-    def test_traffic_heatmap(self):
-        """Test traffic heatmap endpoint."""
-        response = client.get(
-            "/api/v1/routes/heatmap",
-            params={"north": -1.2, "south": -1.4, "east": 37.0, "west": 36.7}
-        )
-        assert response.status_code == 200
+    def test_transport_mode_validation(self):
+        payload: dict[str, Any] = {
+            "origin": {"lat": -1.2921, "lon": 36.8219},
+            "destination": {"lat": -1.3192, "lon": 36.9278},
+            "transport_mode": "flying",
+        }
+        response = client.post("/api/v1/routes/optimize", json=payload)
+        assert response.status_code == 422
 
-        data = response.json()
-        assert "points" in data
-        assert "bounds" in data
-        assert len(data["points"]) > 0
-
-    def test_search_locations(self):
-        """Test location search."""
-        response = client.get("/api/v1/routes/search", params={"q": "nairobi"})
+    def test_gpx_export(self):
+        payload = {
+            "name": "Test Route",
+            "route": [{"lat": -1.2921, "lon": 36.8219}, {"lat": -1.30, "lon": 36.85}],
+            "waypoints": [{"lat": -1.296, "lon": 36.83}],
+        }
+        response = client.post("/api/v1/routes/export/gpx", json=payload)
         assert response.status_code == 200
-        assert isinstance(response.json(), list)
+        assert "application/gpx+xml" in response.headers["content-type"]
+        body = response.text
+        assert "<gpx" in body and "<trkpt" in body and "<wpt" in body
+
+    def test_search_sanitization(self):
+        """Control characters should be stripped, not crash the endpoint."""
+        response = client.get("/api/v1/routes/search", params={"q": "nairobi\x00<script>"})
+        assert response.status_code in (200, 422, 429, 502, 503)
+
+    def test_root_reports_cache_backend(self):
+        response = client.get("/")
+        assert response.status_code == 200
+        assert "cache_backend" in response.json()

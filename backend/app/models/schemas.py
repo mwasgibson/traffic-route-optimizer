@@ -1,8 +1,17 @@
 """Pydantic models for request/response validation."""
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional, Dict, Any
 from enum import Enum
 from datetime import datetime
+
+from ..core.config import settings
+
+
+class TransportMode(str, Enum):
+    """Supported routing profiles."""
+    DRIVING = "driving"
+    CYCLING = "cycling"
+    WALKING = "walking"
 
 
 class Coordinates(BaseModel):
@@ -11,10 +20,25 @@ class Coordinates(BaseModel):
     lon: float = Field(..., ge=-180, le=180, description="Longitude")
 
 
+class NavigationInstruction(BaseModel):
+    """A single turn-by-turn navigation step."""
+    instruction: str = Field(..., description="Human-readable instruction")
+    distance_m: float = Field(..., description="Distance covered by this step")
+    duration_s: float = Field(..., description="Duration of this step")
+    maneuver_type: str = Field(..., description="Maneuver type (turn, merge, arrive...)")
+    street_name: Optional[str] = Field(None, description="Street/road name if known")
+
+
 class RouteRequest(BaseModel):
     """Request model for route optimization."""
     origin: Coordinates
     destination: Coordinates
+
+    # Multi-stop: optional intermediate stops visited in order
+    waypoints: List[Coordinates] = Field(
+        default_factory=list,
+        description="Optional intermediate stops, visited in order",
+    )
 
     # Optimization preferences (0-100)
     time_weight: int = Field(85, ge=0, le=100, description="Weight for travel time")
@@ -25,20 +49,37 @@ class RouteRequest(BaseModel):
     # Vehicle type affects fuel calculation
     vehicle_type: str = Field("car", description="car, motorcycle, truck, bus")
 
+    # Routing profile
+    transport_mode: TransportMode = Field(
+        TransportMode.DRIVING,
+        description="Routing profile: driving, cycling, walking",
+    )
+
     # Avoid options
     avoid_tolls: bool = False
     avoid_highways: bool = False
+
+    @field_validator("waypoints")
+    @classmethod
+    def limit_waypoints(cls, v: List[Coordinates]) -> List[Coordinates]:
+        if len(v) > settings.max_waypoints:
+            raise ValueError(
+                f"Too many waypoints: {len(v)} (max {settings.max_waypoints})"
+            )
+        return v
 
     class Config:
         json_schema_extra: Dict[str, Any] = {
             "example": {
                 "origin": {"lat": -1.2921, "lon": 36.8219},
                 "destination": {"lat": -1.3192, "lon": 36.9278},
+                "waypoints": [{"lat": -1.3032, "lon": 36.8582}],
                 "time_weight": 85,
                 "distance_weight": 60,
                 "safety_weight": 90,
                 "fuel_weight": 75,
                 "vehicle_type": "car",
+                "transport_mode": "driving",
                 "avoid_tolls": False,
                 "avoid_highways": False
             }
@@ -119,6 +160,9 @@ class RouteAlternative(BaseModel):
     # Traffic segments along route
     traffic_segments: List[TrafficSegment] = []
 
+    # Turn-by-turn navigation instructions
+    instructions: List[NavigationInstruction] = []
+
     # Warnings
     warnings: List[str] = []
 
@@ -179,3 +223,10 @@ class ErrorResponse(BaseModel):
     error: str
     detail: Optional[str] = None
     code: Optional[str] = None
+
+
+class GpxExportRequest(BaseModel):
+    """Request model for GPX export."""
+    name: str = Field("Traffic Route Optimizer Export", max_length=120)
+    route: List[Coordinates] = Field(..., min_length=2)
+    waypoints: List[Coordinates] = Field(default_factory=list)

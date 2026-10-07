@@ -22,6 +22,10 @@ import {
   LocateFixed,
   Crosshair,
   MapPinned,
+  Plus,
+  Trash2,
+  Footprints,
+  PersonStanding,
 } from "lucide-react";
 import { routeApi } from "@/services/api";
 import { useGeolocation } from "@/hooks/useGeolocation";
@@ -40,6 +44,8 @@ interface RoutePanelProps {
   onOptimize: (params: {
     origin: Coordinates;
     destination: Coordinates;
+    waypoints: Coordinates[];
+    transportMode: "driving" | "cycling" | "walking";
     timeWeight: number;
     distanceWeight: number;
     safetyWeight: number;
@@ -436,6 +442,7 @@ function VehicleSelector({
     { id: "motorcycle", icon: Bike, label: "Bike" },
     { id: "truck", icon: Truck, label: "Truck" },
     { id: "bus", icon: Bus, label: "Bus" },
+    { id: "footprint", icon: Footprints, label: "Footprint" },
   ];
 
   return (
@@ -523,11 +530,20 @@ export function RoutePanel({
 
   const canOptimize = originCoords !== null && destCoords !== null;
 
+  const [stops, setStops] = useState<
+    Array<{ name: string; coords: Coordinates }>
+  >([]);
+  const [transportMode, setTransportMode] = useState<
+    "driving" | "cycling" | "walking"
+  >("driving");
+
   const handleOptimize = () => {
     if (!canOptimize) return;
     onOptimize({
       origin: originCoords!,
       destination: destCoords!,
+      waypoints: stops.map((s) => s.coords),
+      transportMode,
       timeWeight,
       distanceWeight,
       safetyWeight,
@@ -591,6 +607,51 @@ export function RoutePanel({
             }}
             iconColor="bg-red-400"
           />
+        </div>
+
+        {/* Multi-stop waypoints */}
+        <div className="mt-3 space-y-2">
+          {stops.map((stop, idx) => (
+            <div key={idx} className="flex items-center gap-2">
+              <div className="flex-1">
+                <LocationSearchInput
+                  label={`Stop ${idx + 1}`}
+                  value={stop.name}
+                  onSelect={(name, coords) => {
+                    const next = [...stops];
+                    next[idx] = { name, coords };
+                    setStops(next);
+                  }}
+                  iconColor="bg-amber-400"
+                />
+              </div>
+              <button
+                onClick={() => setStops(stops.filter((_, i) => i !== idx))}
+                className="mt-4 p-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-500 hover:text-red-400 hover:border-red-500/40"
+                title="Remove stop"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          ))}
+          {stops.length < 8 && (
+            <button
+              onClick={() =>
+                setStops([...stops, { name: "", coords: { lat: 0, lon: 0 } }])
+              }
+              className="flex items-center gap-1.5 text-xs text-blue-400 hover:text-blue-300 transition-colors"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              Add stop (multi-stop route)
+            </button>
+          )}
+        </div>
+
+        <div className="mt-4">
+          <label className="text-xs text-slate-400 mb-2 block">
+            Transport Mode
+          </label>
+          <ModeSelector value={transportMode} onChange={setTransportMode} />
         </div>
 
         <div className="mt-4">
@@ -748,6 +809,43 @@ export function RoutePanel({
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+/* ─── Transport Mode Selector ───────────────────────────── */
+function ModeSelector({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (v: "driving" | "cycling" | "walking") => void;
+}) {
+  const modes = [
+    { id: "driving", icon: Car, label: "Driving" },
+    { id: "cycling", icon: Bike, label: "Cycling" },
+    { id: "walking", icon: PersonStanding, label: "Walking" },
+  ];
+  return (
+    <div className="grid grid-cols-3 gap-2">
+      {modes.map((m) => {
+        const Icon = m.icon;
+        const active = value === m.id;
+        return (
+          <button
+            key={m.id}
+            onClick={() => onChange(m.id as "driving" | "cycling" | "walking")}
+            className={`flex flex-col items-center gap-1 p-2 rounded-lg border transition-all text-xs ${
+              active
+                ? "bg-purple-500/20 border-purple-500/40 text-purple-300"
+                : "bg-slate-900/50 border-slate-700 text-slate-400 hover:text-slate-300"
+            }`}
+          >
+            <Icon className="w-4 h-4" />
+            <span>{m.label}</span>
+          </button>
+        );
+      })}
     </div>
   );
 }

@@ -1,23 +1,45 @@
 """Production route optimization engine with real routing APIs."""
+import hashlib
 import math
-from typing import List, Dict, Tuple, Any
+from typing import List, Dict, Tuple, Any, Optional
 from datetime import datetime, timezone
 import uuid
 import httpx
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+)
 
 from ..models.schemas import (
     Coordinates, RouteAlternative, RouteMetrics, RouteOptimizationResponse,
-    TrafficCondition, WeatherCondition, TrafficSegment
+    TrafficCondition, WeatherCondition, TrafficSegment, TransportMode,
+    NavigationInstruction,
 )
 from ..core.config import settings
 from .weather_service import WeatherService
 from .traffic_service import TrafficService
+from .cache import cache
 
 
 class RouteOptimizer:
-    """Production multi-factor route optimization engine."""
+    """Production multi-factor route optimization engine.
 
-    OSRM_URL = "http://router.project-osrm.org/route/v1/driving"
+    Supports multi-stop trips (ordered waypoints), transport-mode-aware
+    routing (driving via OSRM, cycling/walking via OpenRouteService), and
+    turn-by-turn navigation instructions parsed from the routing response.
+    """
+
+    OSRM_URL = "http://router.project-osrm.org/route/v1"
+    ORS_URL = "https://api.openrouteservice.org/v2/directions"
+
+    # OSRM / ORS profile mapping by transport mode
+    ORS_PROFILES = {
+        TransportMode.DRIVING: "driving-car",
+        TransportMode.CYCLING: "cycling-regular",
+        TransportMode.WALKING: "foot-walking",
+    }
 
     # Fuel consumption rates (L/100km) by vehicle type
     FUEL_RATES = {
@@ -32,7 +54,10 @@ class RouteOptimizer:
     def __init__(self):
         self.weather_service = WeatherService()
         self.traffic_service = TrafficService()
-        self.routing_client = httpx.AsyncClient(timeout=30.0)
+        self.routing_client = httpx.AsyncClient(
+            timeout=30.0,
+            headers={"User-Agent": "TrafficRouteOptimizer/1.1"},
+        )
 
     def _haversine_distance(self, p1: Coordinates, p2: Coordinates) -> float:
         R = 6371
@@ -43,81 +68,214 @@ class RouteOptimizer:
         a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
         return R * 2 * math.asin(math.sqrt(a))
 
-    async def _get_real_routes_from_osrm(
+    def _route_cache_key(
         self,
         origin: Coordinates,
-        destination: Coordinates
-    ) -> List[Dict[str, Any]]:
-        """Fetch real road-following routes using the free OSRM engine."""
-        try:
-            coords = f"{origin.lon},{origin.lat};{destination.lon},{destination.lat}"
-            url = f"{self.OSRM_URL}/{coords}"
+        destination: Coordinates,
+        waypoints: List[Coordinates],
+        mode: TransportMode,
+    ) -> str:
+        raw = (
+            f"{origin.lat},{origin.lon};"
+            + ";".join(f"{w.lat},{w.lon}" for w in waypoints)
+            + f";{destination.lat},{destination.lon};{mode.value}"
+        )
+        digest = hashlib.sha256(raw.encode()).hexdigest()[:24]
+        return f"route:{mode.value}:{digest}"
 
-            # OSRM expects alternatives=3 or number/boolean
-            params: Dict[str, Any] = {
-                    "overview": "full",
-                    "geometries": "geojson",
-                    "steps": "true",
-                    "alternatives": "3"
-                }
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=8),
+        retry=retry_if_exception_type(httpx.TransportError),
+        reraise=False,
+    )
+    async def _request_osrm(
+        self,
+        origin: Coordinates,
+        destination: Coordinates,
+        waypoints: List[Coordinates],
+    ) -> Optional[Dict[str, Any]]:
+        """Query OSRM for real road-following routes (driving profile)."""
+        # Multi-stop: OSRM visits coordinates in the order provided
+        all_points = [origin, *waypoints, destination]
+        coords = ";".join(f"{p.lon},{p.lat}" for p in all_points)
+        url = f"{self.OSRM_URL}/driving/{coords}"
 
-            response = await self.routing_client.get(url, params=params, timeout=15.0)
-            if response.status_code != 200:
-                return []
+        params: Dict[str, Any] = {
+            "overview": "full",
+            "geometries": "geojson",
+            "steps": "true",
+            "alternatives": "3" if not waypoints else "false",
+        }
 
-            data = response.json()
-            routes: List[Dict[str, Any]] = []
+        response = await self.routing_client.get(url, params=params, timeout=15.0)
+        if response.status_code != 200:
+            return None
+        return response.json()
 
-            for route_item in data.get("routes", []):
-                geometry = route_item.get("geometry", {})
-                coords_list = geometry.get("coordinates", [])
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=8),
+        retry=retry_if_exception_type(httpx.TransportError),
+        reraise=False,
+    )
+    async def _request_ors(
+        self,
+        origin: Coordinates,
+        destination: Coordinates,
+        waypoints: List[Coordinates],
+        mode: TransportMode,
+    ) -> Optional[Dict[str, Any]]:
+        """Query OpenRouteService for non-driving profiles (or as ORS fallback)."""
+        if not settings.openroute_api_key:
+            return None
 
-                # OSRM returns [lon, lat], convert to Coordinates(lat, lon)
-                path = [Coordinates(lat=c[1], lon=c[0]) for c in coords_list]
+        profile = self.ORS_PROFILES.get(mode, "driving-car")
+        url = f"{self.ORS_URL}/{profile}"
 
-                routes.append({
-                    "path": path,
-                    "distance_m": route_item.get("distance", 0),
-                    "duration_s": route_item.get("duration", 0)
-                })
+        # ORS expects [lon, lat] pairs
+        coordinates = [
+            [origin.lon, origin.lat],
+            *[[w.lon, w.lat] for w in waypoints],
+            [destination.lon, destination.lat],
+        ]
 
-            # If OSRM returned fewer than 3 routes, create additional real-road routes 
-            # by inserting offset waypoints along the road network:
-            if len(routes) < 3 and len(routes) > 0:
-                base_path = routes[0]["path"]
-                mid_idx = len(base_path) // 2
-                mid_point = base_path[mid_idx]
+        response = await self.routing_client.post(
+            url,
+            json={"coordinates": coordinates},
+            headers={"Authorization": settings.openroute_api_key},
+            timeout=20.0,
+        )
+        if response.status_code != 200:
+            return None
+        return response.json()
 
-                # Generate up to 3 routes using intermediate road waypoints
-                offsets = [(0.003, 0.003), (-0.003, -0.003)]
-                for off_lat, off_lon in offsets:
-                    if len(routes) >= 3:
-                        break
-                    via_lat = mid_point.lat + off_lat
-                    via_lon = mid_point.lon + off_lon
-                    
-                    via_coords = f"{origin.lon},{origin.lat};{via_lon},{via_lat};{destination.lon},{destination.lat}"
-                    via_url = f"{self.OSRM_URL}/{via_coords}"
-                    via_res = await self.routing_client.get(
-                        via_url, 
-                        params={"overview": "full", "geometries": "geojson"}, 
-                        timeout=10.0
+    @staticmethod
+    def _parse_osrm_instructions(route_item: Dict[str, Any]) -> List[NavigationInstruction]:
+        """Parse OSRM steps into turn-by-turn navigation instructions."""
+        instructions: List[NavigationInstruction] = []
+        for leg in route_item.get("legs", []):
+            for step in leg.get("steps", []):
+                maneuver = step.get("maneuver", {})
+                m_type = maneuver.get("type", "continue")
+                modifier = maneuver.get("modifier")
+                street = step.get("name") or None
+
+                # Build a human-readable instruction
+                phrase = m_type.replace("_", " ")
+                if modifier:
+                    phrase = f"{modifier} {phrase}"
+                text = phrase.capitalize()
+                if street:
+                    text += f" onto {street}"
+
+                instructions.append(NavigationInstruction(
+                    instruction=text,
+                    distance_m=round(step.get("distance", 0), 1),
+                    duration_s=round(step.get("duration", 0), 1),
+                    maneuver_type=m_type,
+                    street_name=street,
+                ))
+        return instructions
+
+    @staticmethod
+    def _parse_ors_instructions(feature: Dict[str, Any]) -> List[NavigationInstruction]:
+        """Parse OpenRouteService steps into turn-by-turn navigation instructions."""
+        instructions: List[NavigationInstruction] = []
+        props = feature.get("properties", {})
+        for segment in props.get("segments", []):
+            for step in segment.get("steps", []):
+                instructions.append(NavigationInstruction(
+                    instruction=step.get("instruction", "Continue"),
+                    distance_m=round(step.get("distance", 0), 1),
+                    duration_s=round(step.get("duration", 0), 1),
+                    maneuver_type=str(step.get("type", "continue")),
+                    street_name=step.get("name") or None,
+                ))
+        return instructions
+
+    async def _get_real_routes(
+        self,
+        origin: Coordinates,
+        destination: Coordinates,
+        waypoints: List[Coordinates],
+        mode: TransportMode,
+    ) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """Fetch real road-following routes.
+
+        Returns (routes, data_sources). Driving uses OSRM (alternatives
+        supported); cycling/walking use OpenRouteService when a key is set.
+        """
+        sources: List[str] = []
+
+        if mode == TransportMode.DRIVING:
+            data = await self._request_osrm(origin, destination, waypoints)
+            if data:
+                sources.append("OSRM")
+                routes: List[Dict[str, Any]] = []
+                for route_item in data.get("routes", []):
+                    coords_list = route_item.get("geometry", {}).get("coordinates", [])
+                    path = [Coordinates(lat=c[1], lon=c[0]) for c in coords_list]
+                    routes.append({
+                        "path": path,
+                        "distance_m": route_item.get("distance", 0),
+                        "duration_s": route_item.get("duration", 0),
+                        "instructions": self._parse_osrm_instructions(route_item),
+                    })
+
+                # If OSRM returned fewer than 3 routes, try offset-via routes
+                if 0 < len(routes) < 3 and not waypoints:
+                    routes = await self._augment_with_via_routes(
+                        origin, destination, routes
                     )
-                    if via_res.status_code == 200:
-                        vdata = via_res.json()
-                        if vdata.get("routes"):
-                            vroute = vdata["routes"][0]
-                            vcoords = vroute.get("geometry", {}).get("coordinates", [])
-                            routes.append({
-                                "path": [Coordinates(lat=c[1], lon=c[0]) for c in vcoords],
-                                "distance_m": vroute.get("distance", 0),
-                                "duration_s": vroute.get("duration", 0)
-                            })
+                if routes:
+                    return routes, sources
 
-            return routes
+        # Non-driving mode, or OSRM unavailable: try OpenRouteService
+        data = await self._request_ors(origin, destination, waypoints, mode)
+        if data and data.get("features"):
+            sources.append("OpenRouteService")
+            feature = data["features"][0]
+            coords_list = feature.get("geometry", {}).get("coordinates", [])
+            path = [Coordinates(lat=c[1], lon=c[0]) for c in coords_list]
+            props = feature.get("properties", {})
+            summary = props.get("summary", {})
+            return [{
+                "path": path,
+                "distance_m": summary.get("distance", 0),
+                "duration_s": summary.get("duration", 0),
+                "instructions": self._parse_ors_instructions(feature),
+            }], sources
 
-        except Exception:
-            return []
+        return [], sources
+
+    async def _augment_with_via_routes(
+        self,
+        origin: Coordinates,
+        destination: Coordinates,
+        routes: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Create additional real-road routes via offset intermediate waypoints."""
+        base_path = routes[0]["path"]
+        mid_idx = len(base_path) // 2
+        mid_point = base_path[mid_idx]
+
+        offsets = [(0.003, 0.003), (-0.003, -0.003)]
+        for off_lat, off_lon in offsets:
+            if len(routes) >= 3:
+                break
+            via = Coordinates(lat=mid_point.lat + off_lat, lon=mid_point.lon + off_lon)
+            data = await self._request_osrm(origin, destination, [via])
+            if data and data.get("routes"):
+                route_item = data["routes"][0]
+                coords_list = route_item.get("geometry", {}).get("coordinates", [])
+                routes.append({
+                    "path": [Coordinates(lat=c[1], lon=c[0]) for c in coords_list],
+                    "distance_m": route_item.get("distance", 0),
+                    "duration_s": route_item.get("duration", 0),
+                    "instructions": self._parse_osrm_instructions(route_item),
+                })
+        return routes
 
     def _generate_route_path(
         self,
@@ -286,22 +444,41 @@ class RouteOptimizer:
         self,
         origin: Coordinates,
         destination: Coordinates,
+        waypoints: Optional[List[Coordinates]] = None,
         time_weight: int = 85,
         distance_weight: int = 60,
         safety_weight: int = 90,
         fuel_weight: int = 75,
         vehicle_type: str = "car",
+        transport_mode: TransportMode = TransportMode.DRIVING,
         avoid_tolls: bool = False,
         avoid_highways: bool = False
     ) -> RouteOptimizationResponse:
-        """Production route optimization with real APIs."""
+        """Production route optimization with real APIs.
+
+        Supports multi-stop trips via ordered waypoints and
+        transport-mode-aware routing (driving/cycling/walking).
+        """
         start_time = datetime.now(timezone.utc)
+        waypoints = waypoints or []
+
+        # Route-level response cache (weights don't change the geometry)
+        cache_key = self._route_cache_key(origin, destination, waypoints, transport_mode)
+        cached = await cache.get_json(cache_key)
+        if cached is not None:
+            response = RouteOptimizationResponse(**cached)
+            # Keep request_id/timestamp fresh per request
+            response.request_id = str(uuid.uuid4())
+            response.timestamp = datetime.now(timezone.utc)
+            return response
 
         # Fetch real weather data
         weather = await self.weather_service.get_weather(origin)
 
-        # Fetch real road paths from OSRM
-        osrm_routes = await self._get_real_routes_from_osrm(origin, destination)
+        # Fetch real road paths (mode-aware, multi-stop aware)
+        real_routes, routing_sources = await self._get_real_routes(
+            origin, destination, waypoints, transport_mode
+        )
 
         route_configs: List[Dict[str, Any]] = [
             {"id": "route_a", "name": "Route A", "description": "Fastest Route", "color": "#10b981", "deviation": 0.0},
@@ -311,11 +488,13 @@ class RouteOptimizer:
 
         routes: List[RouteAlternative] = []
         for idx, config in enumerate(route_configs):
-            if idx < len(osrm_routes) and osrm_routes[idx]:
-                real_route = osrm_routes[idx]
+            instructions: List[NavigationInstruction] = []
+            if idx < len(real_routes) and real_routes[idx]:
+                real_route = real_routes[idx]
                 path = real_route["path"]
                 distance_km = real_route["distance_m"] / 1000
                 base_time_min = real_route["duration_s"] / 60
+                instructions = real_route.get("instructions", [])
             else:
                 path = self._generate_route_path(origin, destination, deviation=config["deviation"])
                 distance_km = self._calculate_route_distance(path)
@@ -362,6 +541,7 @@ class RouteOptimizer:
                 path=path,
                 metrics=metrics,
                 traffic_segments=traffic_segments,
+                instructions=instructions,
                 warnings=[],
                 insights=[]
             )
@@ -385,9 +565,9 @@ class RouteOptimizer:
 
         processing_time = int((datetime.now(timezone.utc) - start_time).total_seconds() * 1000)
 
-        data_sources = ["OpenWeatherMap", "OpenStreetMap/Nominatim", "OSRM"]
+        data_sources = ["OpenWeatherMap", "OpenStreetMap/Nominatim", *routing_sources]
 
-        return RouteOptimizationResponse(
+        response = RouteOptimizationResponse(
             request_id=str(uuid.uuid4()),
             timestamp=datetime.now(timezone.utc),
             origin_address=None,
@@ -400,6 +580,12 @@ class RouteOptimizer:
             processing_time_ms=processing_time,
             data_sources=data_sources
         )
+
+        # Cache the full response for identical future requests
+        await cache.set_json(
+            cache_key, response.model_dump(mode="json"), settings.route_cache_ttl
+        )
+        return response
 
     async def close(self):
         await self.weather_service.close()

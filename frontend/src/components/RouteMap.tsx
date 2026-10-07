@@ -9,6 +9,7 @@ interface RouteMapProps {
   origin: Coordinates;
   destination: Coordinates;
   activeRouteId: string | null;
+  waypoints?: Coordinates[];
 }
 
 export function RouteMap({
@@ -16,6 +17,7 @@ export function RouteMap({
   origin,
   destination,
   activeRouteId,
+  waypoints = [],
 }: RouteMapProps) {
   const mapRef = useRef<HTMLDivElement>(null);
   const leafletMap = useRef<L.Map | null>(null);
@@ -87,7 +89,13 @@ export function RouteMap({
     })
       .addTo(markers)
       .bindPopup('<b style="color:#333">Destination</b>');
-  }, [origin, destination]);
+
+    (waypoints ?? []).forEach((w, i) => {
+      L.marker([w.lat, w.lon], { icon: createIcon("#f59e0b") })
+        .addTo(markers)
+        .bindPopup(`<b style="color:#333">Stop ${i + 1}</b>`);
+    });
+  }, [origin, destination, waypoints]);
 
   // Update routes
   useEffect(() => {

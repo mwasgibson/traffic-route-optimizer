@@ -55,6 +55,7 @@ export interface RouteAlternative {
   traffic_segments: TrafficSegment[];
   warnings: string[];
   insights: string[];
+  instructions: NavigationInstruction[];
 }
 
 /** Route optimization request */
@@ -68,6 +69,8 @@ export interface RouteRequest {
   vehicle_type: string;
   avoid_tolls: boolean;
   avoid_highways: boolean;
+  waypoints?: Coordinates[];
+  transport_mode?: TransportMode;
 }
 
 /** Route optimization response */
@@ -108,4 +111,16 @@ export interface LocationSearchResult {
   address: string;
   coordinates: Coordinates;
   type: string;
+}
+
+/** Transport routing profiles */
+export type TransportMode = "driving" | "cycling" | "walking";
+
+/** A single turn-by-turn navigation step */
+export interface NavigationInstruction {
+  instruction: string;
+  distance_m: number;
+  duration_s: number;
+  maneuver_type: string;
+  street_name: string | null;
 }

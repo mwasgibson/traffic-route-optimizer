@@ -1,5 +1,8 @@
 import { useState, useCallback } from "react";
-import { Map, Navigation, Activity } from "lucide-react";
+import { Map, Navigation, Activity, Download } from "lucide-react";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
+import { TurnByTurnPanel } from "@/components/TurnbyTurnPanel";
+import { buildGpx, downloadGpx } from "@/utils/gpx";
 import { RouteMap } from "@/components/RouteMap";
 import { RoutePanel } from "@/components/RoutePanel";
 import { RouteComparison } from "@/components/RouteComparison";
@@ -28,8 +31,11 @@ export function Dashboard() {
       vehicleType: string;
       avoidTolls: boolean;
       avoidHighways: boolean;
+      waypoints: Coordinates[];
+      transportMode: "driving" | "cycling" | "walking";
     }) => {
       setMapBounds({ origin: params.origin, destination: params.destination });
+      setMapWaypoints(params.waypoints);
       setActiveRouteId(null);
 
       await optimize({
@@ -42,10 +48,14 @@ export function Dashboard() {
         vehicle_type: params.vehicleType,
         avoid_tolls: params.avoidTolls,
         avoid_highways: params.avoidHighways,
+        waypoints: params.waypoints,
+        transport_mode: params.transportMode,
       });
     },
     [optimize],
   );
+
+  const [mapWaypoints, setMapWaypoints] = useState<Coordinates[]>([]);
 
   const handleReset = useCallback(() => {
     reset();
@@ -78,6 +88,30 @@ export function Dashboard() {
               className="bg-slate-700 hover:bg-slate-600 text-slate-300 font-medium py-2 px-4 rounded-lg transition-all text-sm"
             >
               New Search
+            </button>
+          )}
+          {data && (
+            <button
+              onClick={() => {
+                const route =
+                  data.routes.find((r) => r.route_id === activeRouteId) ??
+                  data.routes.find(
+                    (r) => r.route_id === data.recommended_route_id,
+                  );
+                if (!route) return;
+                downloadGpx(
+                  `${route.name.replace(/\s+/g, "_")}.gpx`,
+                  buildGpx(
+                    `${route.name} — Traffic Route Optimizer`,
+                    route.path,
+                    mapWaypoints,
+                  ),
+                );
+              }}
+              className="bg-slate-700 hover:bg-slate-600 text-slate-300 font-medium py-2 px-4 rounded-lg transition-all text-sm flex items-center gap-2"
+            >
+              <Download className="w-4 h-4" />
+              GPX
             </button>
           )}
           <div className="flex items-center gap-2">
@@ -115,12 +149,15 @@ export function Dashboard() {
             <>
               {/* Map */}
               <div className="flex-1 min-h-0">
-                <RouteMap
-                  routes={data.routes}
-                  origin={mapBounds.origin}
-                  destination={mapBounds.destination}
-                  activeRouteId={activeRouteId}
-                />
+                <ErrorBoundary>
+                  <RouteMap
+                    routes={data.routes}
+                    origin={mapBounds.origin}
+                    destination={mapBounds.destination}
+                    waypoints={mapWaypoints}
+                    activeRouteId={activeRouteId}
+                  />
+                </ErrorBoundary>
               </div>
 
               {/* Bottom Comparison */}
@@ -166,6 +203,15 @@ export function Dashboard() {
         {/* Right Panel */}
         {data && (
           <div className="w-72 bg-slate-800/50 border-l border-slate-700 flex flex-col overflow-y-auto">
+            <TurnByTurnPanel
+              route={
+                data.routes.find((r) => r.route_id === activeRouteId) ??
+                data.routes.find(
+                  (r) => r.route_id === data.recommended_route_id,
+                ) ??
+                null
+              }
+            />
             <AIInsights
               routes={data.routes}
               recommendedRouteId={data.recommended_route_id}
